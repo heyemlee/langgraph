@@ -1,8 +1,9 @@
 """End-to-end tests for `TracePolicy` input processing on node trace runs."""
 
 import asyncio
+import operator
 from collections.abc import AsyncIterator, Iterator
-from typing import Any
+from typing import Annotated, Any
 from uuid import UUID
 
 import pytest
@@ -19,7 +20,7 @@ from langgraph._internal._runnable import (
 )
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.types import TracePolicy
+from langgraph.types import Send, TracePolicy
 from tests.fake_tracer import FakeTracer, Run
 
 
@@ -336,3 +337,101 @@ async def test_trace_policy_cancel_at_node_end_still_closes_tracer_run() -> None
         await asyncio.sleep(0.01)
 
     assert [r.outputs for r in tracer.runs] == [{"recorded": "outputs"}]
+
+
+class _FanOutState(TypedDict):
+    done: Annotated[list[str], operator.add]
+
+
+def _fan_out_graph(route: Any) -> CompiledStateGraph:
+    return (
+        StateGraph(_FanOutState)
+        .add_node("worker", lambda arg: {"done": [arg["item"]]})
+        .add_node("other", lambda state: {"done": ["other"]})
+        .add_conditional_edges(START, route, ["worker", "other"])
+        .compile()
+    )
+
+
+class _ChainEndRecorder(BaseCallbackHandler):
+    def __init__(self) -> None:
+        self.outputs: list[Any] = []
+
+    def on_chain_end(self, outputs: Any, **kwargs: Any) -> None:
+        self.outputs.append(outputs)
+
+
+_SEND_A = Send("worker", {"item": "a"})
+_SEND_B = Send("worker", {"item": "b"})
+
+
+@pytest.mark.parametrize(
+    ("routed", "recorded"),
+    [
+        ([_SEND_A, _SEND_B], ["worker", "worker"]),
+        ((_SEND_A,), ["worker"]),
+        (_SEND_A, "worker"),
+        (["other", _SEND_A], ["other", "worker"]),
+        ("other", "other"),
+        (["other"], ["other"]),
+    ],
+)
+def test_conditional_edge_run_records_destinations_of_sends(
+    routed: Any, recorded: Any
+) -> None:
+    def route(state: _FanOutState) -> Any:
+        return routed
+
+    tracer = FakeTracer()
+    _fan_out_graph(route).invoke({"done": []}, {"callbacks": [tracer]})
+
+    assert _node_run(tracer, "route").outputs == {"output": recorded}
+
+
+def test_conditional_edge_sends_reach_nodes_and_other_handlers() -> None:
+    def route(state: _FanOutState) -> list[Send]:
+        return [_SEND_A, _SEND_B]
+
+    handler = _ChainEndRecorder()
+    tracer = FakeTracer()
+    result = _fan_out_graph(route).invoke(
+        {"done": []}, {"callbacks": [handler, tracer]}
+    )
+
+    assert sorted(result["done"]) == ["a", "b"]
+    assert [_SEND_A, _SEND_B] in handler.outputs
+    assert _node_run(tracer, "route").outputs == {"output": ["worker", "worker"]}
+
+
+@pytest.mark.anyio
+async def test_conditional_edge_run_records_destinations_of_sends_async() -> None:
+    async def route(state: _FanOutState) -> list[Send]:
+        return [_SEND_A, _SEND_B]
+
+    handler = _ChainEndRecorder()
+    tracer = FakeTracer()
+    result = await _fan_out_graph(route).ainvoke(
+        {"done": []}, {"callbacks": [handler, tracer]}
+    )
+
+    assert sorted(result["done"]) == ["a", "b"]
+    assert [_SEND_A, _SEND_B] in handler.outputs
+    assert _node_run(tracer, "route").outputs == {"output": ["worker", "worker"]}
+
+
+@pytest.mark.anyio
+async def test_conditional_edge_sends_stay_in_astream_events() -> None:
+    def route(state: _FanOutState) -> list[Send]:
+        return [_SEND_A, _SEND_B]
+
+    tracer = FakeTracer()
+    ends = [
+        event["data"]["output"]
+        async for event in _fan_out_graph(route).astream_events(
+            {"done": []}, {"callbacks": [tracer]}, version="v2"
+        )
+        if event["event"] == "on_chain_end" and event["name"] == "route"
+    ]
+
+    assert ends == [[_SEND_A, _SEND_B]]
+    assert _node_run(tracer, "route").outputs == {"output": ["worker", "worker"]}

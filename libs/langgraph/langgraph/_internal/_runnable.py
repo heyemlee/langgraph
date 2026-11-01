@@ -117,6 +117,37 @@ def _split_handlers(manager: _M) -> tuple[_M, _M]:
     return real, tracers
 
 
+def _end_run(
+    run_manager: CallbackManagerForChainRun,
+    output: Any,
+    process_outputs: Callable[[Any], Any] | None,
+) -> None:
+    recorded = _trace_payload(output, process_outputs)
+    if recorded is output:
+        run_manager.on_chain_end(output)
+    else:
+        real, tracers = _split_handlers(run_manager)
+        tracers.on_chain_end(recorded)
+        real.on_chain_end(output)
+
+
+async def _aend_run(
+    run_manager: AsyncCallbackManagerForChainRun,
+    output: Any,
+    process_outputs: Callable[[Any], Any] | None,
+) -> None:
+    recorded = _trace_payload(output, process_outputs)
+    if recorded is output:
+        await run_manager.on_chain_end(output)
+    else:
+        real, tracers = _split_handlers(run_manager)
+        # Tracers end first: on_chain_end is shielded once it starts, so a
+        # cancellation can only skip the other handlers' end, never leave a
+        # tracer run open.
+        await tracers.on_chain_end(recorded)
+        await real.on_chain_end(output)
+
+
 def _set_config_context(
     config: RunnableConfig, run: Any = None
 ) -> Token[RunnableConfig | None]:
@@ -341,6 +372,7 @@ class RunnableCallable(Runnable):
         trace: bool = True,
         recurse: bool = True,
         explode_args: bool = False,
+        process_outputs: Callable[[Any], Any] | None = None,
         **kwargs: Any,
     ) -> None:
         self.name = name
@@ -363,6 +395,7 @@ class RunnableCallable(Runnable):
         self.trace = trace
         self.recurse = recurse
         self.explode_args = explode_args
+        self.process_outputs = process_outputs
         # check signature
         if func is None and afunc is None:
             raise ValueError("At least one of func or afunc must be provided.")
@@ -399,7 +432,16 @@ class RunnableCallable(Runnable):
         repr_args = {
             k: v
             for k, v in self.__dict__.items()
-            if k not in {"name", "func", "afunc", "config", "kwargs", "trace"}
+            if k
+            not in {
+                "name",
+                "func",
+                "afunc",
+                "config",
+                "kwargs",
+                "trace",
+                "process_outputs",
+            }
         }
         return f"{self.get_name()}({', '.join(f'{k}={v!r}' for k, v in repr_args.items())})"
 
@@ -474,7 +516,7 @@ class RunnableCallable(Runnable):
                 run_manager.on_chain_error(e)
                 raise
             else:
-                run_manager.on_chain_end(ret)
+                _end_run(run_manager, ret, self.process_outputs)
         else:
             ret = self.func(*args, **kwargs)
         if self.recurse and isinstance(ret, Runnable):
@@ -549,7 +591,7 @@ class RunnableCallable(Runnable):
                 await run_manager.on_chain_error(e)
                 raise
             else:
-                await run_manager.on_chain_end(ret)
+                await _aend_run(run_manager, ret, self.process_outputs)
         else:
             ret = await self.afunc(*args, **kwargs)
         if self.recurse and isinstance(ret, Runnable):
@@ -580,12 +622,17 @@ def is_async_generator(
 
 
 def coerce_to_runnable(
-    thing: RunnableLike, *, name: str | None, trace: bool
+    thing: RunnableLike,
+    *,
+    name: str | None,
+    trace: bool,
+    process_outputs: Callable[[Any], Any] | None = None,
 ) -> Runnable:
     """Coerce a runnable-like object into a Runnable.
 
     Args:
         thing: A runnable-like object.
+        process_outputs: Processes what tracers record as the output of a callable.
 
     Returns:
         A Runnable.
@@ -596,13 +643,16 @@ def coerce_to_runnable(
         return RunnableLambda(thing, name=name)
     elif callable(thing):
         if is_async_callable(thing):
-            return RunnableCallable(None, thing, name=name, trace=trace)
+            return RunnableCallable(
+                None, thing, name=name, trace=trace, process_outputs=process_outputs
+            )
         else:
             return RunnableCallable(
                 thing,
                 wraps(thing)(partial(run_in_executor, None, thing)),  # type: ignore[arg-type]
                 name=name,
                 trace=trace,
+                process_outputs=process_outputs,
             )
     elif isinstance(thing, dict):
         return RunnableParallel(thing)
@@ -693,27 +743,12 @@ class RunnableSeq(Runnable):
         return run_manager
 
     def _end(self, run_manager: CallbackManagerForChainRun, output: Any) -> None:
-        recorded = _trace_payload(output, self.trace_policy.process_outputs)
-        if recorded is output:
-            run_manager.on_chain_end(output)
-        else:
-            real, tracers = _split_handlers(run_manager)
-            tracers.on_chain_end(recorded)
-            real.on_chain_end(output)
+        _end_run(run_manager, output, self.trace_policy.process_outputs)
 
     async def _aend(
         self, run_manager: AsyncCallbackManagerForChainRun, output: Any
     ) -> None:
-        recorded = _trace_payload(output, self.trace_policy.process_outputs)
-        if recorded is output:
-            await run_manager.on_chain_end(output)
-        else:
-            real, tracers = _split_handlers(run_manager)
-            # Tracers end first: on_chain_end is shielded once it starts, so a
-            # cancellation can only skip the other handlers' end, never leave a
-            # tracer run open.
-            await tracers.on_chain_end(recorded)
-            await real.on_chain_end(output)
+        await _aend_run(run_manager, output, self.trace_policy.process_outputs)
 
     def __or__(
         self,

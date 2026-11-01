@@ -80,6 +80,20 @@ def _get_branch_path_input_schema(
     return input
 
 
+def send_destinations(output: Any) -> Any:
+    """Return what tracers record for the `output` of a conditional edge.
+
+    A tracer renders a `Send` with `repr`, copying its `arg` (often the whole state)
+    into the edge's run while the source node waits. The target node's run records
+    `arg` as its input, so the edge's run keeps only the destination.
+    """
+    if isinstance(output, Send):
+        return output.node
+    if isinstance(output, (list, tuple)) and any(isinstance(o, Send) for o in output):
+        return [o.node if isinstance(o, Send) else o for o in output]
+    return output
+
+
 class BranchSpec(NamedTuple):
     path: Runnable[Any, Hashable | list[Hashable]]
     ends: dict[Hashable, str] | None
